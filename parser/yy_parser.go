@@ -11,6 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:generate go run goyacc/main.go -o parser.go parser.y
+//go:generate rm y.output
 package parser
 
 import (
