@@ -19,6 +19,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
 	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
@@ -78,6 +80,8 @@ type connArray struct {
 	streamTimeout chan *tikvrpc.Lease
 	// batchConn is not null when batch is enabled.
 	*batchConn
+
+	*turboClient
 }
 
 func newConnArray(maxSize uint, addr string, security config.Security, idleNotify *uint32, done <-chan struct{}) (*connArray, error) {
@@ -90,6 +94,14 @@ func newConnArray(maxSize uint, addr string, security config.Security, idleNotif
 		return nil, err
 	}
 	return a, nil
+}
+
+func parseAddr(addr string) (grpcAddr, turboAddr string) {
+	idx := strings.IndexByte(addr, ',')
+	if idx > 0 {
+		return addr[:idx], addr[idx+1:]
+	}
+	return addr, ""
 }
 
 func (a *connArray) Init(addr string, security config.Security, idleNotify *uint32, done <-chan struct{}) error {
@@ -121,11 +133,12 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 	}
 	keepAlive := cfg.TiKVClient.GrpcKeepAliveTime
 	keepAliveTimeout := cfg.TiKVClient.GrpcKeepAliveTimeout
+	grpcAddr, turboAddr := parseAddr(addr)
 	for i := range a.v {
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		conn, err := grpc.DialContext(
 			ctx,
-			addr,
+			grpcAddr,
 			opt,
 			grpc.WithInitialWindowSize(grpcInitialWindowSize),
 			grpc.WithInitialConnWindowSize(grpcInitialConnWindowSize),
@@ -171,7 +184,15 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 	if allowBatch {
 		go a.batchSendLoop(cfg.TiKVClient)
 	}
-
+	if turboAddr != "" {
+		var err error
+		a.turboClient, err = dialTurbo(turboAddr)
+		if err != nil {
+			logutil.BgLogger().Error("dial turbo client failed", zap.Error(err))
+			return nil
+		}
+		go a.sendLoop()
+	}
 	return nil
 }
 
@@ -292,6 +313,9 @@ func (c *rpcClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	connArray, err := c.getConnArray(addr)
 	if err != nil {
 		return nil, errors.Trace(err)
+	}
+	if connArray.turboClient != nil && req.Type == tikvrpc.CmdGet {
+		return connArray.sendBoostRequest(req)
 	}
 
 	if config.GetGlobalConfig().TiKVClient.MaxBatchSize > 0 {
