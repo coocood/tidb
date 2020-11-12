@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/ngaut/unistore/lockstore"
 	"github.com/ngaut/unistore/tikv/dbreader"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -42,10 +41,10 @@ import (
 )
 
 // HandleCopRequest handles coprocessor request.
-func HandleCopRequest(dbReader *dbreader.DBReader, lockStore *lockstore.MemStore, req *coprocessor.Request) *coprocessor.Response {
+func HandleCopRequest(dbReader *dbreader.DBReader, req *coprocessor.Request) *coprocessor.Response {
 	switch req.Tp {
 	case kv.ReqTypeDAG:
-		return handleCopDAGRequest(dbReader, lockStore, req)
+		return handleCopDAGRequest(dbReader, req)
 	case kv.ReqTypeAnalyze:
 		return handleCopAnalyzeRequest(dbReader, req)
 	case kv.ReqTypeChecksum:
@@ -57,7 +56,6 @@ func HandleCopRequest(dbReader *dbreader.DBReader, lockStore *lockstore.MemStore
 type dagContext struct {
 	*evalContext
 	dbReader      *dbreader.DBReader
-	lockStore     *lockstore.MemStore
 	resolvedLocks []uint64
 	dagReq        *tipb.DAGRequest
 	keyRanges     []*coprocessor.KeyRange
@@ -65,7 +63,7 @@ type dagContext struct {
 }
 
 // handleCopDAGRequest handles coprocessor DAG request.
-func handleCopDAGRequest(dbReader *dbreader.DBReader, lockStore *lockstore.MemStore, req *coprocessor.Request) (resp *coprocessor.Response) {
+func handleCopDAGRequest(dbReader *dbreader.DBReader, req *coprocessor.Request) (resp *coprocessor.Response) {
 	startTime := time.Now()
 	resp = &coprocessor.Response{}
 	failpoint.Inject("mockCopCacheInUnistore", func(cacheVersion failpoint.Value) {
@@ -87,7 +85,7 @@ func handleCopDAGRequest(dbReader *dbreader.DBReader, lockStore *lockstore.MemSt
 			}
 		}
 	})
-	dagCtx, dagReq, err := buildDAG(dbReader, lockStore, req)
+	dagCtx, dagReq, err := buildDAG(dbReader, req)
 	if err != nil {
 		resp.OtherError = err.Error()
 		return resp
@@ -100,7 +98,7 @@ func handleCopDAGRequest(dbReader *dbreader.DBReader, lockStore *lockstore.MemSt
 	return buildResp(chunks, closureExec.counts, dagReq, err, dagCtx.sc.GetWarnings(), time.Since(startTime))
 }
 
-func buildDAG(reader *dbreader.DBReader, lockStore *lockstore.MemStore, req *coprocessor.Request) (*dagContext, *tipb.DAGRequest, error) {
+func buildDAG(reader *dbreader.DBReader, req *coprocessor.Request) (*dagContext, *tipb.DAGRequest, error) {
 	if len(req.Ranges) == 0 {
 		return nil, nil, errors.New("request range is null")
 	}
@@ -118,7 +116,6 @@ func buildDAG(reader *dbreader.DBReader, lockStore *lockstore.MemStore, req *cop
 	ctx := &dagContext{
 		evalContext:   &evalContext{sc: sc},
 		dbReader:      reader,
-		lockStore:     lockStore,
 		dagReq:        dagReq,
 		keyRanges:     req.Ranges,
 		startTS:       req.StartTs,

@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ngaut/unistore/lockstore"
 	"github.com/ngaut/unistore/tikv/dbreader"
 	"github.com/ngaut/unistore/tikv/mvcc"
 	"github.com/pingcap/badger"
@@ -188,11 +187,10 @@ func isPrefixNext(key []byte, expected []byte) bool {
 // return a dag context according to dagReq and key ranges.
 func newDagContext(store *testStore, keyRanges []kv.KeyRange, dagReq *tipb.DAGRequest, startTs uint64) *dagContext {
 	sc := flagsToStatementContext(dagReq.Flags)
-	txn := store.db.NewTransaction(false)
+	txn := store.db.NewSnapshot(nil, nil)
 	dagCtx := &dagContext{
 		evalContext: &evalContext{sc: sc},
 		dbReader:    dbreader.NewDBReader(nil, []byte{255}, txn),
-		lockStore:   store.locks,
 		dagReq:      dagReq,
 		startTS:     startTs,
 	}
@@ -399,13 +397,13 @@ func buildEQIntExpr(colID, val int64) *tipb.Expr {
 }
 
 type testStore struct {
-	db      *badger.DB
-	locks   *lockstore.MemStore
+	db      *badger.ShardingDB
 	dbPath  string
 	logPath string
 }
 
 func (ts *testStore) prewrite(req *kvrpcpb.PrewriteRequest) {
+	wb := ts.db.NewWriteBatch()
 	for _, m := range req.Mutations {
 		lock := &mvcc.MvccLock{
 			MvccLockHdr: mvcc.MvccLockHdr{
@@ -419,27 +417,27 @@ func (ts *testStore) prewrite(req *kvrpcpb.PrewriteRequest) {
 			Primary: req.PrimaryLock,
 			Value:   m.Value,
 		}
-		ts.locks.Put(m.Key, lock.MarshalBinary())
+		wb.Put(1, m.Key, y.ValueStruct{Value: lock.MarshalBinary()})
 	}
 }
 
 func (ts *testStore) commit(keys [][]byte, startTS, commitTS uint64) error {
-	return ts.db.Update(func(txn *badger.Txn) error {
-		for _, key := range keys {
-			lock := mvcc.DecodeLock(ts.locks.Get(key, nil))
-			userMeta := mvcc.NewDBUserMeta(startTS, commitTS)
-			err := txn.SetEntry(&badger.Entry{
-				Key:      y.KeyWithTs(key, commitTS),
-				Value:    lock.Value,
-				UserMeta: userMeta,
-			})
-			if err != nil {
-				return err
-			}
-			ts.locks.Delete(key)
+	wb := ts.db.NewWriteBatch()
+	snap := ts.db.NewSnapshot(nil, nil)
+	for _, key := range keys {
+		val := snap.Get(1, y.KeyWithTs(key, 0))
+		lock := mvcc.DecodeLock(val.Value)
+		userMeta := mvcc.NewDBUserMeta(startTS, commitTS)
+		err := wb.Put(0, key, y.ValueStruct{Value: lock.Value, UserMeta: userMeta, Version: commitTS})
+		if err != nil {
+			return err
 		}
-		return nil
-	})
+		err = wb.Delete(1, key, 0)
+		if err != nil {
+			return err
+		}
+	}
+	return ts.db.Write(wb)
 }
 
 func newTestStore(dbPrefix string, logPrefix string) (*testStore, error) {
@@ -465,19 +463,18 @@ func newTestStore(dbPrefix string, logPrefix string) (*testStore, error) {
 	os.Mkdir(snapPath, os.ModePerm)
 	return &testStore{
 		db:      db,
-		locks:   lockstore.NewMemStore(4096),
 		dbPath:  dbPath,
 		logPath: LogPath,
 	}, nil
 }
 
-func createTestDB(dbPath, LogPath string) (*badger.DB, error) {
+func createTestDB(dbPath, LogPath string) (*badger.ShardingDB, error) {
 	subPath := fmt.Sprintf("/%d", 0)
-	opts := badger.DefaultOptions
+	opts := badger.ShardingDBDefaultOpt
 	opts.Dir = dbPath + subPath
 	opts.ValueDir = LogPath + subPath
-	opts.ManagedTxns = true
-	return badger.Open(opts)
+	opts.CFs = []badger.CFConfig{{Managed: true}, {Managed: false}, {Managed: false}}
+	return badger.OpenShardingDB(opts)
 }
 
 func cleanTestStore(store *testStore) {

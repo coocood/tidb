@@ -424,13 +424,18 @@ func (e *closureExecutor) checkRangeLock() error {
 }
 
 func (e *closureExecutor) checkRangeLockForRange(ran kv.KeyRange) error {
-	it := e.lockStore.NewIterator()
+	it := e.dbReader.GetLockIter()
 	for it.Seek(ran.StartKey); it.Valid(); it.Next() {
-		if exceedEndKey(it.Key(), ran.EndKey) {
+		item := it.Item()
+		if exceedEndKey(item.Key(), ran.EndKey) {
 			break
 		}
-		lock := mvcc.DecodeLock(it.Value())
-		err := checkLock(lock, it.Key(), e.startTS, e.resolvedLocks)
+		val, err := item.Value()
+		if err != nil {
+			return err
+		}
+		lock := mvcc.DecodeLock(val)
+		err = checkLock(lock, item.Key(), e.startTS, e.resolvedLocks)
 		if err != nil {
 			return err
 		}
